@@ -1,0 +1,109 @@
+#!/bin/sh
+PREREQ=""
+prereqs()
+{
+    echo "$PREREQ"
+}
+
+case $1 in
+prereqs)
+    prereqs
+    exit 0
+    ;;
+esac
+
+# shellcheck disable=SC1091
+. /usr/share/initramfs-tools/hook-functions
+
+# configuration
+ROOT_DATASET="rpool/ROOT/pve-1"
+
+# setup host environment
+if [ -f /etc/zfs/root.jwe ]; then
+    copy_file text /etc/zfs/root.jwe /etc/zfs/root.jwe
+else
+    echo "ERROR: /etc/zfs/root.jwe missing."
+    exit 1
+fi
+
+# copy clevis binaries
+for BIN in clevis clevis-decrypt clevis-decrypt-tang jose curl jq; do
+    if [ -x "/usr/bin/$BIN" ]; then copy_exec "/usr/bin/$BIN"; fi
+done
+
+# copy ip binary
+IP_PATH=$(command -v ip)
+if [ -n "$IP_PATH" ]; then copy_exec "$IP_PATH" /bin/ip; fi
+
+# copy ssl certs
+if [ -f /etc/ssl/certs/ca-certificates.crt ]; then
+    copy_file text /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+fi
+
+# create the zfs extension script
+# the zfs boot script explicitly sources this file if it exists.
+EXTENSION_PATH="${DESTDIR}/etc/zfs/initramfs-tools-load-key"
+
+mkdir -p "${DESTDIR}/etc/zfs"
+
+echo "DATASET='${ROOT_DATASET}'" > "$EXTENSION_PATH"
+
+cat >> "$EXTENSION_PATH" << 'EOF'
+# no shebang needed, this is sourced by /scripts/zfs
+
+# config
+JWE="/etc/zfs/root.jwe"
+export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+
+# logging helper
+log() { echo "zfs-clevis: $1" > /dev/console; }
+
+# the parent script provides $ENCRYPTIONROOT, but we fallback to config if needed
+TARGET="${ENCRYPTIONROOT:-$DATASET}"
+
+log "Extension started for $TARGET"
+
+# network wait loop (30s max) - we need to wait for networking because this
+# extension runs very early in the boot process
+MAX_RETRIES=30
+i=0
+
+while [ $i -lt $MAX_RETRIES ]; do
+    if ip route | grep -q "default"; then
+        log "Network detected. Decrypting..."
+
+        PASS=$(clevis decrypt < "$JWE" 2>/dev/null)
+
+        if [ -n "$PASS" ]; then
+
+            # Attempt load-key using the password
+            echo "$PASS" | zfs load-key "$TARGET" >/dev/null 2>&1
+
+            # Check status
+            STATUS=$(zfs get -H -o value keystatus "$TARGET")
+
+            if [ "$STATUS" = "available" ]; then
+                log "Key loaded successfully."
+                return 0 # SUCCESS: Tell parent script to stop asking
+            else
+                log "Key load failed (Status: $STATUS). Wrong password?"
+                return 1 # FAIL: Fallback to manual prompt
+            fi
+        else
+            log "Clevis decryption failed."
+            return 1 # FAIL: Fallback to manual prompt
+        fi
+    fi
+
+    i=$((i+1))
+    if [ $((i % 2)) -eq 0 ]; then
+        log "Waiting for network... ($i/$MAX_RETRIES)"
+    fi
+    sleep 1
+done
+
+log "Network timeout. Falling back to manual."
+return 1
+EOF
+
+chmod +x "$EXTENSION_PATH"
