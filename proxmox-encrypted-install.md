@@ -1,84 +1,124 @@
-# Proxmox VE: Encrypted Root (ZFS) + Dropbear + Clevis/Tang unlocking
+# Proxmox VE: Encrypted Root with Remote Unlock
 
-This guide descripbes a modified Proxmox VE Install in Debug Mode to fully
-encrypt the root ZFS pool and setup dropbear based SSH unlocking and optional
-clevis/tang based automated unlock based on a networked host.
+**ZFS Encryption • Dropbear SSH • Clevis/Tang Automation**
 
-**Prerequisites:** Console Access (Physical/KVM), Tang Server available via HTTP/HTTPS.
+This guide details a modified Proxmox VE installation in Debug Mode. It
+achieves a fully encrypted ZFS root pool that can be unlocked remotely via SSH
+(Dropbear) or automatically via a networked key server (Clevis/Tang).
+
+**Prerequisites:**
+
+  * Console Access (Physical/KVM)
+  * Tang Server available via HTTP/HTTPS (for automation phase)
 
 -----
 
-## Phase 1: Modified Proxmox VE Install
+## Chapter 1: The Installation
 
-*Since the Proxmox ISO does not natively support ZFS encryption in the UI, we inject parameters into the installer script during the live boot.*
+Since the Proxmox ISO does not natively support ZFS encryption in the UI, we
+must inject parameters into the installer script during the live boot.
 
 ### 1\. Boot into Debug Mode
 
-1.  Boot the Proxmox VE ISO.
-2.  Select **"Install Proxmox VE (Terminal UI Debug Mode)"** (usually under Advanced Options).
+Boot the Proxmox VE ISO and select **"Install Proxmox VE (Terminal UI Debug
+Mode)"**.
 
-### 2\. Create Temporary Key (Debug Shell \#2)
+### 2\. Create a Temporary Key
 
-1.  Exit the first debug prompt (`#1`) with `Ctrl+D` or `exit`
-2.  At the **second** debug prompt (`#2`), create a temporary key:
-    ```bash
-    echo -n "temporarypassword" > /tmp/install.key
-    ```
+The installer needs a file to read the encryption key from. We will create a
+temporary key in the second debug shell.
+
+1.  Exit the first debug prompt (`#1`) by pressing `Ctrl+D` or typing `exit`.
+2.  At the **second** debug prompt (`#2`), run:
+
+<!-- end list -->
+
+```bash
+echo -n "temporarypassword" > /tmp/install.key
+```
 
 ### 3\. Patch the Installer Script
 
-1.  Edit the installer module:
-    ```bash
-    vim /usr/share/perl5/Proxmox/Install.pm
-    ```
-2.  Search for `zpool create`
-3.  Inject the encryption arguments immediately after `create`:
-      * **Before:** `my $cmd = "zpool create -f -o cachefile=none";`
-      * **After:**
-        ```perl
-        my $cmd = "zpool create -O encryption=on -O keyformat=passphrase -O keylocation=file:///tmp/install.key -f -o cachefile=none";
-        ```
+We need to modify the Proxmox installer perl module to include the ZFS
+encryption flags.
+
+Open the file:
+
+```bash
+vim /usr/share/perl5/Proxmox/Install.pm
+```
+
+Search for the text `zpool create`. You will find a line defining the creation
+command. Replace that line with the version below, which injects
+`encryption=on`, `keyformat=passphrase`, and points to our temporary key file.
+
+```perl
+# /usr/share/perl5/Proxmox/Install.pm
+
+# ...
+# OLD LINE:
+# my $cmd = "zpool create -f -o cachefile=none";
+
+# NEW LINE:
+my $cmd = "zpool create -O encryption=on -O keyformat=passphrase -O keylocation=file:///tmp/install.key -f -o cachefile=none";
+# ...
+```
 
 ### 4\. Run the Installation
 
-1.  Type `exit` to launch the GUI.
-2.  **Target Harddisk:** Select `Advanced Options` -\> `zfs`. (Encryption options will not appear in UI).
-3.  **Important:** Uncheck **"Automatically reboot after successful installation"**.
-4.  Install. When finished, select "Reboot Now" to exit to the 3rd debug shell.
+Type `exit` to launch the GUI installer and proceed with the following specific
+settings:
 
-### 5\. Finalize Keys
+  * **Target Harddisk:** Select `Advanced Options` -\> `zfs`. (Note: Encryption options will *not* appear here, but they are now injected in the backend).
+  * **Reboot:** Uncheck **"Automatically reboot after successful installation"**.
 
-1.  Import the pool:
-    ```bash
-    zpool import -f -R /mnt rpool
-    ```
-2.  Unlock and rotate to real password:
-    ```bash
-    zfs load-key -a
-    zfs change-key -o keyformat=passphrase -o keylocation=prompt rpool
-    # Enter your REAL, PERMANENT passphrase now.
-    ```
-3.  Export and reboot:
-    ```bash
-    zpool export rpool
-    exit
-    ```
+When the installation finishes, select "Reboot Now" to exit to the 3rd debug
+shell.
+
+### 5\. Finalize and Rotate Keys
+
+Before the system boots for the first time, we must switch from the temporary
+file-based key to a real user-entered passphrase.
+
+Import the pool:
+
+```bash
+zpool import -f -R /mnt rpool
+```
+
+Load the temporary key, then rotate to your real, permanent passphrase:
+
+```bash
+zfs load-key -a
+zfs change-key -o keyformat=passphrase -o keylocation=prompt rpool
+# Enter your REAL, PERMANENT passphrase now.
+```
+
+Export the pool and reboot:
+
+```bash
+zpool export rpool
+exit
+```
 
 -----
 
-## Phase 2: Environment Prep
+## Chapter 2: System Configuration
 
-Unlock the root filesystem at boot by entering the passphrase. Login as `root` via console or SSH.
+Unlock the root filesystem at boot by entering your passphrase. Login as `root`
+via console or SSH.
 
-### 1\. Configure Repositories
+### Configure Repositories
 
-We disable the enterprise repositories and enable the no-subscription
-repositories using the modern `.sources` format. We also remove the `quiet`
-boot parameter to ensure visibility during the unlock process.
+We will disable enterprise repositories, enable the no-subscription
+repositories, remove the `quiet` boot parameter to ensure we can see the
+unlock prompt, and update the system before continuing.
+
+*Note: you can do this part via the Proxmox web GUI instead*
 
 ```bash
 # Remove 'quiet' from boot logs
-sed -i 's/quiet//' /etc/default/grub
+sed -i '/^GRUB_CMDLINE_LINUX_DEFAULT=/ s/quiet//' /etc/default/grub
 
 # Disable existing enterprise entries
 echo "Enabled: false" >> /etc/apt/sources.list.d/pve-enterprise.sources
@@ -105,223 +145,192 @@ EOF
 apt update && apt dist-upgrade -y
 ```
 
-### 2\. Install Dependencies
+### Install Dependencies
 
-We use `--no-install-recommends`. By default, `clevis-initramfs` recommends
-`cryptsetup-initramfs`. Installing cryptsetup on a ZFS-only system causes build
-errors because it searches for missing LUKS devices.
+We use `--no-install-recommends` here. The default `clevis-initramfs` package
+recommends `cryptsetup-initramfs`, which causes build errors on ZFS-only
+systems (as it searches for missing LUKS devices).
 
 ```bash
 apt install -y --no-install-recommends clevis clevis-initramfs jose jq curl iproute2 dropbear-initramfs
 ```
 
------
+### Setup Dropbear (SSH Fallback)
 
-## Phase 3: Setup Dropbear (SSH Fallback)
+Dropbear allows you to SSH into the initramfs environment to unlock the disk if
+automation fails.
 
-1.  **Add SSH Keys:**
-    Add your public key to `/etc/dropbear/initramfs/authorized_keys`.
+**1. Add SSH Keys**
+Add your public key to the dropbear authorized keys file:
+`/etc/dropbear/initramfs/authorized_keys` and optionally, to the system's root
+account `/root/.ssh/authorized_keys`
 
-2.  **Configure Network:**
-    Edit `/etc/initramfs-tools/initramfs.conf`.
+**2. Configure Network**
+Edit `/etc/initramfs-tools/initramfs.conf` to define how the system gets an IP
+during boot.
 
-    *Option A: DHCP*
-
+  * **For DHCP:**
     ```bash
     IP=dhcp
     # OR specific interface: IP=::::hostname:eno1:dhcp
     ```
-
-    *Option B: Static*
-
+  * **For Static IP:**
     ```bash
     # IP=<client-ip>::<gateway>:<netmask>:<hostname>:<device>:<autoconf>
+	# autoconf (i.e., `dhcp`) is not necessary, because we are defining a
+	# static config
     IP=192.168.1.10::192.168.1.1:255.255.255.0:pve:eno1
     ```
 
-3.  **Update initramfs/sync boot:**
+**3. Apply Changes**
+Update the initramfs and bootloader:
 
-    ```bash
-    update-initramfs -u -k all && proxmox-boot-tool refresh
-    reboot
-    ```
+```bash
+update-initramfs -u -k all && proxmox-boot-tool refresh
+```
 
-4.  **Reboot and test dropbear unlock:**
+**4. Test Dropbear**
+Reboot the system. You should see `Starting dropbear...` in the console.
+Connect via SSH and run `zfsunlock`:
 
-    Reboot the system, and ensure that dropbear starts. At console you should
-    see something like:
+```bash
+# Connect from your workstation
+ssh root@192.168.1.227
 
-    ```
-    IP-Config: ens18 complete (dhcp from 192.168.1.1)
-     address: 192.168.1.227 broadcast: 192.168.1.255    netmask: 255.255.255.0
-     ...
-    Begin: Starting dropbear ...
-    Begin: Importing ZFS root pool 'rpool' ... done.
-    Begin: Importing pool 'rpool' using defaults ... done.
-    Enter passphrase for 'rpool':
-    ```
-
-    Upon SSH into dropbear, `zfsunlock` will allow you to unlock the pool:
-
-    ```bash
-    Are you sure you want to continue connecting (yes/no/[fingerprint])? yes
-    Warning: Permanently added '192.168.1.227' (ED25519) to the list of known hosts.
-
-    BusyBox v1.37.0 (Debian 1:1.37.0-6+b3) built-in shell (ash)
-    Enter 'help' for a list of built-in commands.
-
-    ~ # zfsunlock
-
-    Unlocking encrypted ZFS filesystems...
-    Enter the password or press Ctrl-C to exit.
-
-    🔐 Encrypted ZFS password for rpool: (press TAB for no echo)
-    Password for rpool accepted.
-    Unlocking complete.  Resuming boot sequence...
-    Please reconnect in a while.
-    ```
+# Inside the dropbear session
+zfsunlock
+```
 
 -----
 
-## Phase 4: Setup Clevis & Tang
+## Chapter 3: Automation (Clevis & Tang)
 
-1.  **Trust Tang CA (If private/self-signed):**
-    Copy CA cert to `/usr/local/share/ca-certificates/` and run `update-ca-certificates`.
+This phase sets up automatic unlocking using a remote Tang server.
 
-2.  **Generate JWE Token:**
+### Trust Tang CA
 
-    ```bash
-    mkdir -p /etc/zfs
-	```
+If your Tang server uses a self-signed certificate or private CA, copy the CA
+cert to `/usr/local/share/ca-certificates/` and run `update-ca-certificates`.
 
-    **Choose your configuration strategy below:**
+### Generate the JWE Token
 
-    ### Option A: Single Tang Server (Standard)
+Create the configuration directory:
 
-    Simple setup. If this tang server is unreachable, manual password entry is required.
+```bash
+mkdir -p /etc/zfs
+```
 
-    ```bash
-    read -rs -p "ZFS Root Passphrase: " mypass && echo && \
-    printf "%s" "$mypass" | clevis encrypt tang '{"url": "https://tang.example.com"}' > /etc/zfs/root.jwe && \
-    unset mypass
-    ```
+Choose **one** of the following encryption strategies:
 
-    ### Option B: SSS (High Availability / Redundancy)
+**Strategy A: Single Tang Server (Standard)**
+Use this for a simple setup. If the server is unreachable, manual password
+entry is required.
 
-	Uses Shamir's Secret Sharing. Defined by a threshold `t` (how many keys
-	are needed) and a list of `pins`. See `clevis-encrypt-ss` manpage for more
-	details on SSS
+```bash
+read -rs -p "ZFS Root Passphrase: " mypass && echo && \
+printf "%s" "$mypass" | clevis encrypt tang '{"url": "https://tang.example.com"}' > /etc/zfs/root.jwe && \
+unset mypass
+```
 
-    *Example: Define 2 Tang servers with a threshold of 1 (Logic: Tang1 OR Tang2).*
+**Strategy B: High Availability (SSS)**
+Use this to define a threshold of keys (e.g., Tang1 OR Tang2). The config below
+(`t: 1`) means only 1 server needs to be reachable.
 
-    ```bash
-    # Define the SSS policy JSON
-    # t=1 means only 1 of the defined servers needs to respond to unlock.
-    CFG='{"t": 1, "pins": {"tang": [{"url": "https://tang1.example.com"}, {"url": "https://tang2.example.com"}]}}'
+```bash
+CFG='{"t": 1, "pins": {"tang": [{"url": "https://tang1.example.com"}, {"url": "https://tang2.example.com"}]}}'
 
-    # Encrypt
-    read -rs -p "ZFS Root Passphrase: " mypass && echo && \
-    printf "%s" "$mypass" | clevis encrypt sss "$CFG" > /etc/zfs/root.jwe && \
-    unset mypass
-    ```
+read -rs -p "ZFS Root Passphrase: " mypass && echo && \
+printf "%s" "$mypass" | clevis encrypt sss "$CFG" > /etc/zfs/root.jwe && \
+unset mypass
+```
 
-3.  **Secure the File:**
+**Secure the Keyfile:**
 
-    ```bash
-    chmod 600 /etc/zfs/root.jwe
-    ```
+```bash
+chmod 600 /etc/zfs/root.jwe
+```
 
------
+### The Integration Hook
 
-## Phase 5: The Integration Hook
+We need a hook to inject the Clevis unlock script into the native ZFS boot
+process (`initramfs-tools-load-key`).
 
-This hook injects a script into the native ZFS boot process (`initramfs-tools-load-key`), ensuring Clevis runs at the exact moment ZFS expects a key.
-
-**Create File:** `/etc/initramfs-tools/hooks/zfs-clevis`, using the contents
-from [hooks/zfs-clevis](hooks/zfs-clevis)
+**1. Install Hook**
+Download the hook to `/etc/initramfs-tools/hooks/zfs-clevis`:
 
 ```bash
 wget -q -O /etc/initramfs-tools/hooks/zfs-clevis https://github.com/x123/proxmox-encrypted-zfs/raw/refs/heads/master/hooks/zfs-clevis
 chmod +x /etc/initramfs-tools/hooks/zfs-clevis
 ```
 
-**Update initramfs / sync bootloader:**
+**2. Update Bootloader**
+This rebuilds the initramfs, including the new JWE token and the hook script.
 
 ```bash
 update-initramfs -u -k all && proxmox-boot-tool refresh
 ```
 
-**Reboot & Test:**
-
-As long as the tang server(s) are available, the system should boot cleanly
-without prompting for a passphrase. If the tang server is unavailable, it will
-fall back to the console and dropbear based zfsunlock workflow.
+**3. Reboot & Test**
+As long as the Tang server is reachable, the system should now boot cleanly
+without a passphrase prompt.
 
 -----
 
-## Maintenance: Tang server key rotation
+## Appendix: Key Rotation Workflow
 
-On the tang server, use `tangd-rotate-keys` to generate a new set of keys. The
-old ones will be renamed with a `.` prefixing their names. At this point, both
-the new keys and the old ones are still available to any clients requesting
-decryption, but tang will advertise the new key for any clients wanting to
-encrypt.
+Perform this routine when you need to rotate keys on the Tang server.
 
-You should now follow the guide below to update any active clients that should
-maintain automatic `clevis` based unlocking *before* removing the legacy keys.
+### 1\. Server-Side Rotation
 
-Once all desired clients have had their client JWE tokens updated to the new
-key, you can then remove the legacy keys (or set their perms to `0000`).
+On the Tang server, generate new keys. The old keys will be renamed (prefixed
+with `.`) but remain valid for decryption temporarily to allow clients to
+update.
 
------
+```bash
+# (Run on Tang Server)
+tangd-rotate-keys -d /var/lib/tang
 
-## Maintenance: Key Rotation and Updating the JWE Token on the client-side
+# verify that the permissions, ownership, and key rotation happened
+ls -alh /var/lib/tang/
+```
 
-*Perform this step when the Tang server has advertised new keys, but *before*
-the old keys are deleted/rotated out of the Tang database on the server.*
+### 2\. Client-Side Update
 
-### 1\. Re-encrypt the JWE Token
+**Before** deleting old keys from the server, you must re-encrypt the client's token against the new keys.
 
-We must decrypt the existing token (using the old keys) and immediately re-encrypt it against the current policies.
+**Step A: Regenerate Token**
+Decrypt the existing token and immediately re-encrypt it against the new policy.
 
-1.  **Regenerate the Token:**
-    *Use the command corresponding to your setup in Phase 4.*
-
-    **Option A: Single Tang Server**
+  * **If using Single Tang Server:**
 
     ```bash
     clevis decrypt < /etc/zfs/root.jwe | \
     clevis encrypt tang '{"url": "https://tang.example.com"}' > /etc/zfs/root.jwe.new
     ```
 
-    **Option B: SSS (High Availability)**
-    *Ensure your JSON config matches your original policy.*
+  * **If using SSS (High Availability):**
+    *(Ensure `$CFG` matches your original policy)*
 
     ```bash
-    CFG='{"t": 1, "pins": {"tang": [{"url": "https://tang1.example.com"}, {"url": "https://tang2.example.com"}]}}'
-
     clevis decrypt < /etc/zfs/root.jwe | \
     clevis encrypt sss "$CFG" > /etc/zfs/root.jwe.new
     ```
 
-2.  **Verify and Swap:**
-    Ensure the new file was created successfully before overwriting the old one.
+**Step B: Commit Changes**
+Verify the new file is non-empty, replace the old one, and **update the bootloader**.
 
-    ```bash
-    if [ -s /etc/zfs/root.jwe.new ]; then
-        mv /etc/zfs/root.jwe.new /etc/zfs/root.jwe
-        chmod 600 /etc/zfs/root.jwe
-        echo "Success: JWE updated."
-    else
-        echo "Error: Re-encryption failed. Check connectivity to ALL Tang servers."
-        rm /etc/zfs/root.jwe.new
-    fi
-    ```
-
-### 2\. Update Bootloader
-
-**Critical Step:** The `root.jwe` file is copied into the initramfs image at build time. Updating the file in `/etc/zfs` is not enough; you must rebuild the boot image or the system will continue to use the old key configuration.
+> **Critical:** If you fail to update the initramfs, the system will continue attempting to use the old key on the next boot.
 
 ```bash
-update-initramfs -u -k all && proxmox-boot-tool refresh
+if [ -s /etc/zfs/root.jwe.new ]; then
+    mv /etc/zfs/root.jwe.new /etc/zfs/root.jwe
+    chmod 600 /etc/zfs/root.jwe
+
+    # Update bootloader to include the new key
+    update-initramfs -u -k all && proxmox-boot-tool refresh
+    echo "Success: JWE updated and bootloader refreshed."
+else
+    echo "Error: Re-encryption failed. Check connectivity to ALL Tang servers."
+    rm /etc/zfs/root.jwe.new
+fi
 ```
