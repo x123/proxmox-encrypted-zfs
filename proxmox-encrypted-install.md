@@ -256,7 +256,7 @@ We need a hook to inject the Clevis unlock script into the native ZFS boot
 process (`initramfs-tools-load-key`).
 
 **1. Install Hook**
-Download the hook to `/etc/initramfs-tools/hooks/zfs-clevis`:
+Download the [hook](hooks/zfs-clevis) to `/etc/initramfs-tools/hooks/zfs-clevis`:
 
 ```bash
 wget -q -O /etc/initramfs-tools/hooks/zfs-clevis https://github.com/x123/proxmox-encrypted-zfs/raw/refs/heads/master/hooks/zfs-clevis
