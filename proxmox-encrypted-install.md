@@ -107,9 +107,9 @@ apt update && apt dist-upgrade -y
 
 ### 2\. Install Dependencies
 
-**Critical:** We use `--no-install-recommends`. By default, `clevis-initramfs`
-recommends `cryptsetup-initramfs`. Installing cryptsetup on a ZFS-only system
-causes build errors because it searches for missing LUKS devices.
+We use `--no-install-recommends`. By default, `clevis-initramfs` recommends
+`cryptsetup-initramfs`. Installing cryptsetup on a ZFS-only system causes build
+errors because it searches for missing LUKS devices.
 
 ```bash
 apt install -y --no-install-recommends clevis clevis-initramfs jose jq curl iproute2 dropbear-initramfs
